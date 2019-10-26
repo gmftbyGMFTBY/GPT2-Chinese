@@ -6,6 +6,9 @@ from tqdm import trange
 from pytorch_transformers import GPT2LMHeadModel
 import ipdb
 import numpy as np
+from tqdm import tqdm
+import random
+import pickle
 
 
 def is_word(word):
@@ -126,82 +129,144 @@ def generate(n_ctx, model, context, length, tokenizer, temperature=1, top_k=0, t
 # ========== my own class and function ========== #
 class tool:
     
-    def __init__(self, model, tokenizer, device):
+    '''
+    The tool for computing the Mutual Information and the SRF function
+    '''
+    
+    def __init__(self, model, tokenizer, maxlen=15):
         self.model = model
         self.tokenizer = tokenizer
-        self.device = device
+        self.maxlen = maxlen
         print('Init the tool class over')
     
     def process_raw_text(self, raw_text):
         return self.tokenizer.convert_tokens_to_ids(self.tokenizer.tokenize(raw_text))
+    
+    def pad_seq(self, response):
+        # response: [batch, l]
+        seq, seql = [], []
+        pmaxlen = min(self.maxlen, max([len(i) for i in response]))
+        for i in response:
+            if len(i) >= pmaxlen:
+                seq.append(i[:pmaxlen])
+                seql.append(pmaxlen)
+            else:
+                seq.append(i + ['unk'] * (pmaxlen - len(i)))
+                seql.append(len(i))
+        return seq, seql
         
-    def possibility_sentence(self, context, response, temperature=1):
+    def possibility_sentence(self, context, response, temperature=1, batch_size=1):
         '''
-        :param response: response is the list of the token string
+        :param response: list of [response is the list of the token string]
         :param context: context maybe the empty
         '''
+        # pad
+        response, seql = self.pad_seq(response)    # [batch, l]
         # serlized the string to tensor
         if context:
             # append the split token between the context and response
+            # context: [batch, l_context]
             context += '。'
-            context = self.process_raw_text(context)
+            context = self.process_raw_text(context)[-self.maxlen:]    # [l_context]
+            context = [context for i in range(batch_size)]    # [batch, l_context]
         else:
-            context = self.process_raw_text(response[0])
-            response = response[1:]
-        inputs = torch.LongTensor(context).view(1, -1).to(self.device)
-        length = len(response)
+            context = []    # [batch, 1]
+            for i in response:
+                kk = self.process_raw_text(i[0])
+                if len(kk) > 1: kk = [kk[0]]
+                context.append(kk)
+            response = [i[1:] for i in response]    # [batch, l]
+            seql = [i-1 for i in seql]    # [l]
+        inputs = torch.LongTensor(context).cuda()
+        length = len(response[0])    # [length]
         
-        if len(context) > 1:
+        if len(context[0]) > 1:
             _, past = self.model(inputs[:, :-1], None)[:2]
-            prev = inputs[:, -1].view(1, -1)
+            prev = inputs[:, -1].view(-1, 1)
         else:
             past = None
             prev = inputs
+        # ipdb.set_trace()
         possibility = []
         with torch.no_grad():
             for i in range(length):
                 output = self.model(prev, past=past)
-                output, past = output[:2]
-                output = output[-1].squeeze(0) / temperature
-                next_token = self.tokenizer.convert_tokens_to_ids(response[i])
-                p = torch.softmax(output, dim=-1)[next_token].item()
-                if p < 1e-7:
-                    p = 1e-7
+                output, past = output[:2]     # output [128, 1, 13317]
+                output = output.squeeze(1) / temperature    # [128, 13317]
+                next_tokens = []
+                for res in response:
+                    kk = self.tokenizer.convert_tokens_to_ids(res[i])
+                    if isinstance(kk, list): kk = kk[0]
+                    next_tokens.append(kk)
+                x = list(range(batch_size))
+                output = torch.softmax(output, dim=-1)
+                p = output[x, next_tokens]    # [batch]
+                for k in range(p.shape[0]):
+                    if p[k] < 1e-7:
+                        p[k] = 1e-7
                 possibility.append(p)
-                next_token = torch.tensor([next_token]).to(self.device)
-                next_token = next_token.view(1, 1)
-                prev = next_token
+                next_tokens = torch.tensor(next_tokens).cuda()
+                next_tokens = next_tokens.view(-1, 1)    # [128, 1]
+                prev = next_tokens    # [128, 1]
 
-        return possibility
+        # [batch, length]
+        possibility = torch.stack(possibility).transpose(0, 1)
+        return possibility, seql
     
-    def p_t_s(self, response, context=None):
+    def p_t_s(self, response, context=None, batch_size=128):
         # response and context are the raw text
-        response = list(response)
-        p = self.possibility_sentence(context, response)
-        return p
+        # ipdb.set_trace()
+        response = [list(i) for i in response]
+        p, l = self.possibility_sentence(context, response, batch_size=batch_size)    # [batch, length], l: [batch]
+        
+        for i in range(len(l)):
+            p[i, l[i]:] = 1.0
+            
+        pause = torch.prod(p, 1)    # [batch]
+        for i in range(pause.shape[0]):
+            if pause[i] == 0:
+                pause[i] = 1e-45
+        # ipdb.set_trace()
+        return pause
     
     def get_MI(self, response, context):
-        p_t = np.prod(self.p_t_s(response, context=None))
-        p_t_s = np.prod(self.p_t_s(response, context=context))
+        p_t = self.p_t_s(response, context=None)
+        p_t_s = self.p_t_s(response, context=context)
         
         return np.log(p_t_s / p_t)
+        
+    def get_SRF(self, response, context):
+        p1 = self.p_t_s(response, context=context)
+        p2 = self.p_t_s(response, context=None)
+        p3 = self.p_t_s(context, context=response)
+        s = 1 / 3 * np.log(p1) + 1 / 3 * np.log(p2) - 1 / 3 * np.log(p3)
+        # print(np.log(p1), np.log(p2), np.log(p3))
+        return s
     
-    def get_safe_response(self, response, context):
-        mi = self.get_MI(response, context)
+    
+def load_txt(file):
+    dataset = []
+    with open(file) as f:
+        for line in f.readlines():
+            if not line:
+                line = '哈哈'
+            dataset.append(''.join(line.strip().split()))
+    return dataset
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--device', default='0,1,2,3', type=str, required=False, help='生成设备')
     parser.add_argument('--length', default=-1, type=int, required=False, help='生成长度')
-    parser.add_argument('--batch_size', default=1, type=int, required=False, help='生成的batch size')
+    parser.add_argument('--batch_size', default=128, type=int, required=False, help='生成的batch size')
     parser.add_argument('--nsamples', default=10, type=int, required=False, help='生成几个样本')
     parser.add_argument('--temperature', default=1, type=float, required=False, help='生成温度')
     parser.add_argument('--topk', default=8, type=int, required=False, help='最高几选一')
     parser.add_argument('--topp', default=0, type=float, required=False, help='最高积累概率')
     parser.add_argument('--model_config', default='config/model_config_small.json', type=str, required=False,
                         help='模型参数')
-    parser.add_argument('--tokenizer_path', default='cache/vocab_small.txt', type=str, required=False, help='词表路径')
+    # use the vocab.txt
+    parser.add_argument('--tokenizer_path', default='cache/vocab.txt', type=str, required=False, help='词表路径')
     parser.add_argument('--model_path', default='model/final_model', type=str, required=False, help='模型路径')
     parser.add_argument('--prefix', default='<s>', type=str, required=False, help='生成文章的开头')
     parser.add_argument('--no_wordpiece', action='store_true', help='不做word piece切词')
@@ -221,7 +286,7 @@ def main():
     else:
         from tokenizations import tokenization_bert
 
-    os.environ["CUDA_VISIBLE_DEVICES"] = args.device
+    # os.environ["CUDA_VISIBLE_DEVICES"] = args.device
     length = args.length
     batch_size = args.batch_size
     nsamples = args.nsamples
@@ -234,65 +299,95 @@ def main():
 
     tokenizer = tokenization_bert.BertTokenizer(vocab_file=args.tokenizer_path)
     model = GPT2LMHeadModel.from_pretrained(args.model_path)
-    model.to(device)
+    model.cuda()
     model.eval()
+            
+    t = tool(model, tokenizer, maxlen=10)
     
-    t = tool(model, tokenizer, device)
-    print(t.get_MI('我觉得今天的天气还可以', '今天天气怎么样'))
-    print(t.get_MI('我还挺漂亮的', '今天天气怎么样'))
-    print(t.get_MI('我不知道', '今天天气怎么样',))
+    # load the dialog data
+    src, tgt = load_txt('./data/dialog/src-train.txt'), load_txt('./data/dialog/tgt-train.txt')
+    # sample 128 sentence from target dataset
+    sss = 128
+    sidx = random.sample(list(range(len(tgt))), sss)
+    ptgt = []
+    for i in range(len(tgt)):
+        if i in sidx:
+            ptgt.append(tgt[i])
+    tgt = ptgt
+    sl, tl = [len(i) for i in src], [len(i) for i in tgt]
+    print(f'[!] sl avg length: {round(np.mean(sl), 4)}, tl avg length: {round(np.mean(tl), 4)}')
+    
+    # compute the weight matrix: [45000, 45000]
+    pt_matrix = np.zeros([len(tgt)])    # [m]
+    pts_matrix = np.zeros([len(src), len(tgt)])    # [n, m]
+    pst_matrix = np.zeros([len(tgt), len(src)])    # [m, n]
+    print(f'[!] pt matrix shape: {pt_matrix.shape}')
+    print(f'[!] pts matrix shape: {pts_matrix.shape}')
+    print(f'[!] pst matrix shape: {pst_matrix.shape}')
+    
+    # pt, the possibility of each sentence (128)
+    for i in tqdm(range(0, len(tgt), batch_size)):
+        batch = tgt[i:i+batch_size]
+        pt_matrix[i:i+batch_size] = t.p_t_s(batch, context=None,
+                                            batch_size=len(batch)).cpu().numpy()
+    
+    # pts, p(t|s) the samples in the batch have the same context
+    for i in tqdm(range(len(src))):
+        for j in range(0, len(tgt), batch_size):
+            batch, context = tgt[j:j+batch_size], src[i]
+            pts_matrix[i, j:j+batch_size] = t.p_t_s(batch, context=context, batch_size=len(batch)).cpu().numpy()
+    
+    
+    # pst, p(s|t) the reverse possibility computing
+    for i in tqdm(range(len(tgt))):
+        for j in range(0, len(src), batch_size):
+            batch, context = src[j:j+batch_size], tgt[i]
+            pst_matrix[i, j:j+batch_size] = t.p_t_s(batch, context=context, batch_size=len(batch)).cpu().numpy()
+    
+    with open('./data/dialog/PT.pkl', 'wb') as f:
+        pickle.dump(pt_matrix, f)
+        
+    with open('./data/dialog/PTS.pkl', 'wb') as f:
+        pickle.dump(pts_matrix, f)
+        
+    with open('./data/dialog/PST.pkl', 'wb') as f:
+        pickle.dump(pst_matrix, f)
+        
+    pt_matrix = np.log(pt_matrix)
+    pts_matrix = np.log(pts_matrix)
+    pst_matrix = np.log(pst_matrix).T
+    
+    SRF = pt_matrix / 3 + pts_matrix / 3 - pts_matrix / 3
+    # fix the 128 wrong case in the SRF matrix
+    for i in range(len(sidx)):
+        SRF[sidx[i], i] = -np.inf     # ban it
+        
+    with open('./data/dialog/SRF.pkl', 'wb') as f:
+        pickle.dump([sidx, SRF], f)
+    print(f'[!] save file into ./data/dialog/SRF_matrix, shape: {SRF.shape}')
     
     '''
-    n_ctx = model.config.n_ctx
-    
-    if length == -1:
-        length = model.config.n_ctx
-    if args.save_samples:
-        if not os.path.exists(args.save_samples_path):
-            os.makedirs(args.save_samples_path)
-        samples_file = open(args.save_samples_path + '/samples.txt', 'w', encoding='utf8')
-    while True:
-        raw_text = args.prefix
-        context_tokens = tokenizer.convert_tokens_to_ids(tokenizer.tokenize(raw_text))
-        generated = 0
-        for _ in range(nsamples // batch_size):
-            out = generate(
-                n_ctx=n_ctx,
-                model=model,
-                context=context_tokens,
-                length=length,
-                is_fast_pattern=args.fast_pattern, tokenizer=tokenizer,
-                temperature=temperature, top_k=topk, top_p=topp, repitition_penalty=repetition_penalty, device=device
-            )
-            for i in range(batch_size):
-                generated += 1
-                text = tokenizer.convert_ids_to_tokens(out)
-                for i, item in enumerate(text[:-1]):  # 确保英文前后有空格
-                    if is_word(item) and is_word(text[i + 1]):
-                        text[i] = item + ' '
-                for i, item in enumerate(text):
-                    if item == '[MASK]':
-                        text[i] = ''
-                    if item == '[CLS]' or item == '[SEP]':
-                        text[i] = '\n'
-                info = "=" * 40 + " SAMPLE " + str(generated) + " " + "=" * 40 + "\n"
-                print(info)
-                text = ''.join(text).replace('##', '').strip()
-                print(text)
-                if args.save_samples:
-                    samples_file.write(info)
-                    samples_file.write(text)
-                    samples_file.write('\n')
-                    samples_file.write('=' * 90)
-                    samples_file.write('\n' * 2)
-        print("=" * 80)
-        if generated == nsamples:
-            # close file when finish writing.
-            if args.save_samples:
-                samples_file.close()
-            break
+    print(t.get_SRF('我觉得今天的天气还可以', '今天天气怎么样'))
+    print(t.get_SRF('天气不错', '今天天气怎么样',))
+    print(t.get_SRF('天气挺好的', '今天天气怎么样',))
+    print(t.get_SRF('昨晚没睡好，今天太困', '你怎么天天都这么困啊',))
+    print(t.get_SRF('这天气我觉得跑不了步', '今天天气怎么样'))
+    print('-' * 50)
+    print(t.get_SRF('你还挺漂亮', '今天天气怎么样'))
+    print(t.get_SRF('这次考的还不错', '今天天气怎么样'))
+    print(t.get_SRF('你有病吧', '你是不是喜欢我'))
+    print(t.get_SRF('今天天气确实不错', '你是不是喜欢我'))
+    print('-' * 50)
+    print(t.get_SRF('我不知道', '今天天气怎么样'))
+    print(t.get_SRF('我也这么觉得', '晚上好',))
+    print(t.get_SRF('哈哈', '考的怎么样啊',))
+    print(t.get_SRF('我也这么觉得', '今天天气怎么样',))
+    print(t.get_SRF('我不知道', '你考得怎么样',))
+    print(t.get_SRF('我不知道', '早上好啊',))
     '''
 
 
 if __name__ == '__main__':
     main()
+        
+        

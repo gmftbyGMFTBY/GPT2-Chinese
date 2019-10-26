@@ -112,4 +112,4 @@ python ./generate.py --length=50 --nsamples=4 --prefix=xxx --fast_pattern --save
 GMFTBY uses this pretrained LM to calculate the Mutual Information of the possibility of the sequence.
 
 * Dataset: https://github.com/brightmart/nlp_chinese_corpus (wiki_zh_2019)
-* Fixed: `train.py` class `tool`
+* Fixed: class `tool` in `generate.py`
