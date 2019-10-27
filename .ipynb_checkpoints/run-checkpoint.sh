@@ -1,11 +1,12 @@
 mode=$1
+cuda=$2
 
 if [ $mode = 'train' ]; then
-    CUDA_VISIBLE_DEVICES="3" python train.py \
+    CUDA_VISIBLE_DEVICES="$cuda" python train.py \
         --raw \
         --batch_size 4
 elif [ $mode = 'test' ]; then
-    CUDA_VISIBLE_DEVICES="6" python generate.py \
+    CUDA_VISIBLE_DEVICES="$cuda" python generate.py \
         --length=100 \
         --nsamples=4 \
         --prefix='今天' \

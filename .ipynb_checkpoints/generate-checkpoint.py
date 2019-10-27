@@ -18,6 +18,12 @@ def is_word(word):
     return True
 
 
+
+def normalization(data):
+    _range = np.max(data, axis=1, keepdims=True) - np.min(data, axis=1, keepdims=True)
+    return (data - np.min(data, axis=1, keepdims=True)) / _range
+
+
 def _is_chinese_char(char):
     """Checks whether CP is the codepoint of a CJK character."""
     # This defines a "chinese character" as anything in the CJK Unicode block:
@@ -215,8 +221,14 @@ class tool:
     
     def p_t_s(self, response, context=None, batch_size=128):
         # response and context are the raw text
-        # ipdb.set_trace()
-        response = [list(i) for i in response]
+        # be careful of the case that only contains one character.
+        res = []
+        for i in response:
+            i = list(i)
+            if len(i) == 1: i = ['unk', i[0]]
+            res.append(i)
+        response = res
+        
         p, l = self.possibility_sentence(context, response, batch_size=batch_size)    # [batch, length], l: [batch]
         
         for i in range(len(l)):
@@ -229,20 +241,6 @@ class tool:
         # ipdb.set_trace()
         return pause
     
-    def get_MI(self, response, context):
-        p_t = self.p_t_s(response, context=None)
-        p_t_s = self.p_t_s(response, context=context)
-        
-        return np.log(p_t_s / p_t)
-        
-    def get_SRF(self, response, context):
-        p1 = self.p_t_s(response, context=context)
-        p2 = self.p_t_s(response, context=None)
-        p3 = self.p_t_s(context, context=response)
-        s = 1 / 3 * np.log(p1) + 1 / 3 * np.log(p2) - 1 / 3 * np.log(p3)
-        # print(np.log(p1), np.log(p2), np.log(p3))
-        return s
-    
     
 def load_txt(file):
     dataset = []
@@ -251,6 +249,7 @@ def load_txt(file):
             if not line:
                 line = '哈哈'
             dataset.append(''.join(line.strip().split()))
+    print(f'[!] load file from {file} over')
     return dataset
 
 
@@ -263,7 +262,7 @@ def main():
     parser.add_argument('--temperature', default=1, type=float, required=False, help='生成温度')
     parser.add_argument('--topk', default=8, type=int, required=False, help='最高几选一')
     parser.add_argument('--topp', default=0, type=float, required=False, help='最高积累概率')
-    parser.add_argument('--model_config', default='config/model_config_small.json', type=str, required=False,
+    parser.add_argument('--model_config', default='model/final_model/config.json', type=str, required=False,
                         help='模型参数')
     # use the vocab.txt
     parser.add_argument('--tokenizer_path', default='cache/vocab.txt', type=str, required=False, help='词表路径')
@@ -302,17 +301,20 @@ def main():
     model.cuda()
     model.eval()
             
-    t = tool(model, tokenizer, maxlen=10)
+    t = tool(model, tokenizer, maxlen=15)
+    folder, sss = 'xiaohuangji', 256
     
     # load the dialog data
-    src, tgt = load_txt('./data/dialog/src-train.txt'), load_txt('./data/dialog/tgt-train.txt')
-    # sample 128 sentence from target dataset
-    sss = 128
-    sidx = random.sample(list(range(len(tgt))), sss)
+    src, tgt = load_txt(f'./data/{folder}/src-train.txt'), load_txt(f'./data/{folder}/tgt-train.txt')
+    
+    # sample 256 sentence from target dataset that is very short
+    tgtlength = [-len(i) if len(i) <= 8 else -np.inf for i in tgt]
+    pp = torch.softmax(torch.tensor(tgtlength, dtype=torch.float), dim=0).numpy()
+    sidx = np.random.choice(list(range(len(tgt))), sss, p=pp)
+    
     ptgt = []
-    for i in range(len(tgt)):
-        if i in sidx:
-            ptgt.append(tgt[i])
+    for i in sidx:
+        ptgt.append(tgt[i])
     tgt = ptgt
     sl, tl = [len(i) for i in src], [len(i) for i in tgt]
     print(f'[!] sl avg length: {round(np.mean(sl), 4)}, tl avg length: {round(np.mean(tl), 4)}')
@@ -344,47 +346,32 @@ def main():
             batch, context = src[j:j+batch_size], tgt[i]
             pst_matrix[i, j:j+batch_size] = t.p_t_s(batch, context=context, batch_size=len(batch)).cpu().numpy()
     
-    with open('./data/dialog/PT.pkl', 'wb') as f:
+    with open(f'./data/{folder}/PT.pkl', 'wb') as f:
         pickle.dump(pt_matrix, f)
         
-    with open('./data/dialog/PTS.pkl', 'wb') as f:
+    with open(f'./data/{folder}/PTS.pkl', 'wb') as f:
         pickle.dump(pts_matrix, f)
         
-    with open('./data/dialog/PST.pkl', 'wb') as f:
+    with open(f'./data/{folder}/PST.pkl', 'wb') as f:
         pickle.dump(pst_matrix, f)
         
-    pt_matrix = np.log(pt_matrix)
-    pts_matrix = np.log(pts_matrix)
-    pst_matrix = np.log(pst_matrix).T
+    pt_matrix = normalization(np.log(pt_matrix).reshape(1, -1)).reshape(-1)
+    pts_matrix = normalization(np.log(pts_matrix))
+    pst_matrix = normalization(np.log(pst_matrix).T)
     
-    SRF = pt_matrix / 3 + pts_matrix / 3 - pts_matrix / 3
+    # ignore the zero
+    pt_matrix += 1e-20
+    pts_matrix += 1e-20
+    pst_matrix += 1e-20
+    
+    SRF = 2 * pst_matrix / (pt_matrix + pts_matrix)
     # fix the 128 wrong case in the SRF matrix
     for i in range(len(sidx)):
         SRF[sidx[i], i] = -np.inf     # ban it
         
-    with open('./data/dialog/SRF.pkl', 'wb') as f:
+    with open(f'./data/{folder}/SRF.pkl', 'wb') as f:
         pickle.dump([sidx, SRF], f)
-    print(f'[!] save file into ./data/dialog/SRF_matrix, shape: {SRF.shape}')
-    
-    '''
-    print(t.get_SRF('我觉得今天的天气还可以', '今天天气怎么样'))
-    print(t.get_SRF('天气不错', '今天天气怎么样',))
-    print(t.get_SRF('天气挺好的', '今天天气怎么样',))
-    print(t.get_SRF('昨晚没睡好，今天太困', '你怎么天天都这么困啊',))
-    print(t.get_SRF('这天气我觉得跑不了步', '今天天气怎么样'))
-    print('-' * 50)
-    print(t.get_SRF('你还挺漂亮', '今天天气怎么样'))
-    print(t.get_SRF('这次考的还不错', '今天天气怎么样'))
-    print(t.get_SRF('你有病吧', '你是不是喜欢我'))
-    print(t.get_SRF('今天天气确实不错', '你是不是喜欢我'))
-    print('-' * 50)
-    print(t.get_SRF('我不知道', '今天天气怎么样'))
-    print(t.get_SRF('我也这么觉得', '晚上好',))
-    print(t.get_SRF('哈哈', '考的怎么样啊',))
-    print(t.get_SRF('我也这么觉得', '今天天气怎么样',))
-    print(t.get_SRF('我不知道', '你考得怎么样',))
-    print(t.get_SRF('我不知道', '早上好啊',))
-    '''
+    print(f'[!] save file into ./data/{folder}/SRF_matrix, shape: {SRF.shape}')
 
 
 if __name__ == '__main__':
